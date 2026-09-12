@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import argparse
 import bisect
+import glob
 import hashlib
 import io
 import lzma
@@ -532,8 +533,33 @@ def add_sender_status(img, text1: str, text2: str):
 # Sender
 # ============================================================
 
+def expand_patterns(paths: list[Path]) -> list[Path]:
+    """Expand wildcard patterns that the shell didn't.
+
+    Unix shells expand globs before the program runs, but Windows cmd
+    (and PowerShell) pass patterns like folder\\*.py through literally.
+    Non-file matches (directories) are skipped.
+    """
+    out: list[Path] = []
+
+    for p in paths:
+        s = str(p)
+        if any(ch in s for ch in "*?[") and not p.exists():
+            matches = [Path(m) for m in sorted(glob.glob(s))]
+            files = [m for m in matches if m.is_file()]
+            if not files:
+                raise SystemExit(f"No files match pattern: {s}")
+            out.extend(files)
+        else:
+            out.append(p)
+
+    return out
+
+
 def send_files(paths: list[Path], fps: float, chunk_size: int):
     import cv2
+
+    paths = expand_patterns(paths)
 
     for path in paths:
         if not path.is_file():
