@@ -17,7 +17,8 @@ Protocol v2 highlights:
 - Receiver uses QRCodeDetectorAruco when available and a threaded frame
   grabber so decoding never falls behind the camera.
 - Multiple files (`qrtx send *.py`) are packed into one in-memory tar
-  bundle and sent as a single session; the receiver auto-extracts it.
+  bundle and sent as a single session; the receiver auto-extracts it,
+  preserving paths relative to the files' common parent folder.
 """
 from __future__ import annotations
 
@@ -339,6 +340,19 @@ KIND_FILE = "F"
 KIND_BUNDLE = "B"
 
 
+def _common_parent(paths: list[Path]) -> Path | None:
+    """Deepest common parent folder of the given files, if any."""
+    try:
+        common = Path(os.path.commonpath([p.resolve() for p in paths]))
+    except ValueError:
+        return None
+
+    if common.is_file():  # the same single file given more than once
+        common = common.parent
+
+    return common
+
+
 def bundle_name(paths: list[Path]) -> str:
     """Name a bundle after the files' deepest common parent folder.
 
@@ -347,11 +361,8 @@ def bundle_name(paths: list[Path]) -> str:
     Falls back to a generic name when there is no meaningful common
     folder (e.g. files spread across filesystem roots).
     """
-    try:
-        common = Path(os.path.commonpath([p.resolve() for p in paths]))
-        stem = common.name
-    except ValueError:
-        stem = ""
+    common = _common_parent(paths)
+    stem = common.name if common is not None else ""
 
     if not stem:
         stem = f"bundle_{len(paths)}_files"
@@ -360,17 +371,30 @@ def bundle_name(paths: list[Path]) -> str:
 
 
 def bundle_files(paths: list[Path]) -> tuple[str, bytes]:
-    """Pack several files into an in-memory tar; returns (name, bytes)."""
+    """Pack several files into an in-memory tar; returns (name, bytes).
+
+    Each file is stored under its path relative to the files' common
+    parent folder, so 'send sub/a/*.py sub/b/*.py' arrives as
+    received/sub/a/... and received/sub/b/..., mirroring the sender's
+    layout. Without a common folder, files are stored flat by basename.
+    """
     buf = io.BytesIO()
     used: set[str] = set()
+    common = _common_parent(paths)
 
     with tarfile.open(fileobj=buf, mode="w") as tar:
         for p in paths:
-            arcname = p.name
-            i = 1
-            while arcname in used:
-                arcname = f"{p.stem}_{i}{p.suffix}"
-                i += 1
+            if common is not None:
+                arcname = p.resolve().relative_to(common).as_posix()
+                if arcname in used:  # exact same file listed twice
+                    continue
+            else:
+                arcname = p.name
+                i = 1
+                while arcname in used:
+                    arcname = f"{p.stem}_{i}{p.suffix}"
+                    i += 1
+
             used.add(arcname)
             tar.add(p, arcname=arcname, recursive=False)
 
