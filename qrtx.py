@@ -219,6 +219,20 @@ def xor_bytes(a: bytes, b: bytes) -> bytes:
     ).to_bytes(len(a), "big")
 
 
+def whiten(data: bytes, seed: int) -> bytes:
+    """XOR with a seed-derived pseudorandom keystream (symmetric).
+
+    The last chunk of a session is zero-padded, and zero-heavy QR
+    payloads crash python-qrcode's Reed-Solomon encoder with
+    "ValueError: glog(0)" (lincolnloop/python-qrcode#330, still present
+    in 8.2). Whitening makes every wire payload look pseudorandom, so
+    the bug can never trigger regardless of file content. Sender and
+    receiver derive the same keystream from the droplet seed.
+    """
+    rng = random.Random(seed ^ 0x9E3779B9)
+    return xor_bytes(data, rng.randbytes(len(data)))
+
+
 def make_droplet(chunks: list[bytes], seed: int) -> bytes:
     idxs = droplet_indices(seed, len(chunks))
     out = chunks[idxs[0]]
@@ -313,6 +327,9 @@ class FountainDecoder:
 #   header: Q2H:SID:N:CHUNK:ALGO:KIND:ZLEN:OLEN:SHA:FNAME45
 #   data:   Q2D:SID:N:SEED:CRC32:DATA45
 #
+# DATA45 carries the droplet whitened with a seed-derived keystream
+# (see whiten()); CRC32 covers the whitened bytes as transmitted.
+#
 # KIND is F for a single file, B for a tar bundle of several files
 # (the receiver extracts bundles automatically).
 # ============================================================
@@ -386,7 +403,7 @@ def header_payload(meta: dict) -> str:
 
 
 def data_payload(meta: dict, chunks: list[bytes], seed: int) -> str:
-    droplet = make_droplet(chunks, seed)
+    droplet = whiten(make_droplet(chunks, seed), seed)
     crc = f"{zlib.crc32(droplet) & 0xffffffff:08X}"
     return ":".join([
         MAGIC_DATA,
@@ -419,7 +436,7 @@ def parse_payload(text: str) -> tuple[str, dict] | None:
                 "sid": sid,
                 "n": n,
                 "seed": seed,
-                "droplet": droplet,
+                "droplet": whiten(droplet, seed),
             }
 
         if text.startswith(MAGIC_HEADER + ":"):
