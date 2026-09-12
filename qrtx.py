@@ -28,6 +28,7 @@ import hashlib
 import io
 import lzma
 import math
+import os
 import random
 import sys
 import tarfile
@@ -338,6 +339,26 @@ KIND_FILE = "F"
 KIND_BUNDLE = "B"
 
 
+def bundle_name(paths: list[Path]) -> str:
+    """Name a bundle after the files' deepest common parent folder.
+
+    Sending project/*.py yields "project.tar", so the receiver extracts
+    into received/project/ instead of an anonymous bundle_N_files/.
+    Falls back to a generic name when there is no meaningful common
+    folder (e.g. files spread across filesystem roots).
+    """
+    try:
+        common = Path(os.path.commonpath([p.resolve() for p in paths]))
+        stem = common.name
+    except ValueError:
+        stem = ""
+
+    if not stem:
+        stem = f"bundle_{len(paths)}_files"
+
+    return f"{stem}.tar"
+
+
 def bundle_files(paths: list[Path]) -> tuple[str, bytes]:
     """Pack several files into an in-memory tar; returns (name, bytes)."""
     buf = io.BytesIO()
@@ -353,7 +374,7 @@ def bundle_files(paths: list[Path]) -> tuple[str, bytes]:
             used.add(arcname)
             tar.add(p, arcname=arcname, recursive=False)
 
-    return f"bundle_{len(paths)}_files.tar", buf.getvalue()
+    return bundle_name(paths), buf.getvalue()
 
 
 def build_session(
