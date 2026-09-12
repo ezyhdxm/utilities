@@ -16,16 +16,20 @@ Protocol v2 highlights:
 - Best-of zlib/lzma compression, chosen per file.
 - Receiver uses QRCodeDetectorAruco when available and a threaded frame
   grabber so decoding never falls behind the camera.
+- Multiple files (`qrtx send *.py`) are packed into one in-memory tar
+  bundle and sent as a single session; the receiver auto-extracts it.
 """
 from __future__ import annotations
 
 import argparse
 import bisect
 import hashlib
+import io
 import lzma
 import math
 import random
 import sys
+import tarfile
 import threading
 import time
 import zlib
@@ -305,12 +309,41 @@ class FountainDecoder:
 # output, so every frame keeps its single free-form field last and is
 # parsed with a bounded split.
 #
-#   header: Q2H:SID:N:CHUNK:ALGO:ZLEN:OLEN:SHA:FNAME45
+#   header: Q2H:SID:N:CHUNK:ALGO:KIND:ZLEN:OLEN:SHA:FNAME45
 #   data:   Q2D:SID:N:SEED:CRC32:DATA45
+#
+# KIND is F for a single file, B for a tar bundle of several files
+# (the receiver extracts bundles automatically).
 # ============================================================
 
-def build_session(path: Path, chunk_size: int) -> tuple[dict, list[bytes]]:
-    raw = path.read_bytes()
+KIND_FILE = "F"
+KIND_BUNDLE = "B"
+
+
+def bundle_files(paths: list[Path]) -> tuple[str, bytes]:
+    """Pack several files into an in-memory tar; returns (name, bytes)."""
+    buf = io.BytesIO()
+    used: set[str] = set()
+
+    with tarfile.open(fileobj=buf, mode="w") as tar:
+        for p in paths:
+            arcname = p.name
+            i = 1
+            while arcname in used:
+                arcname = f"{p.stem}_{i}{p.suffix}"
+                i += 1
+            used.add(arcname)
+            tar.add(p, arcname=arcname, recursive=False)
+
+    return f"bundle_{len(paths)}_files.tar", buf.getvalue()
+
+
+def build_session(
+    name: str,
+    raw: bytes,
+    kind: str,
+    chunk_size: int,
+) -> tuple[dict, list[bytes]]:
     sha = file_sha256(raw)
     algo, comp = compress_best(raw)
 
@@ -327,10 +360,11 @@ def build_session(path: Path, chunk_size: int) -> tuple[dict, list[bytes]]:
         "n": n,
         "chunk": chunk_size,
         "algo": algo,
+        "kind": kind,
         "zlen": zlen,
         "olen": len(raw),
         "sha": sha,
-        "name": path.name,
+        "name": name,
     }
     return meta, chunks
 
@@ -342,6 +376,7 @@ def header_payload(meta: dict) -> str:
         str(meta["n"]),
         str(meta["chunk"]),
         meta["algo"],
+        meta["kind"],
         str(meta["zlen"]),
         str(meta["olen"]),
         meta["sha"],
@@ -387,10 +422,13 @@ def parse_payload(text: str) -> tuple[str, dict] | None:
             }
 
         if text.startswith(MAGIC_HEADER + ":"):
-            parts = text.split(":", 8)
-            if len(parts) != 9:
+            parts = text.split(":", 9)
+            if len(parts) != 10:
                 return None
-            _, sid, n_s, chunk_s, algo, zlen_s, olen_s, sha, fn45 = parts
+            (
+                _, sid, n_s, chunk_s, algo, kind,
+                zlen_s, olen_s, sha, fn45,
+            ) = parts
 
             n = int(n_s)
             chunk = int(chunk_s)
@@ -401,12 +439,15 @@ def parse_payload(text: str) -> tuple[str, dict] | None:
                 return None
             if algo not in ("Z", "X") or len(sha) != 64:
                 return None
+            if kind not in (KIND_FILE, KIND_BUNDLE):
+                return None
 
             return "header", {
                 "sid": sid,
                 "n": n,
                 "chunk": chunk,
                 "algo": algo,
+                "kind": kind,
                 "zlen": zlen,
                 "olen": olen,
                 "sha": sha,
@@ -491,11 +532,12 @@ def add_sender_status(img, text1: str, text2: str):
 # Sender
 # ============================================================
 
-def send_file(path: Path, fps: float, chunk_size: int):
+def send_files(paths: list[Path], fps: float, chunk_size: int):
     import cv2
 
-    if not path.is_file():
-        raise SystemExit(f"Not a file: {path}")
+    for path in paths:
+        if not path.is_file():
+            raise SystemExit(f"Not a file: {path}")
 
     if fps <= 0:
         raise SystemExit("--fps must be > 0")
@@ -503,7 +545,15 @@ def send_file(path: Path, fps: float, chunk_size: int):
     if not 100 <= chunk_size <= 1200:
         raise SystemExit("--chunk-size must be between 100 and 1200 bytes")
 
-    meta, chunks = build_session(path, chunk_size)
+    if len(paths) == 1:
+        name = paths[0].name
+        raw = paths[0].read_bytes()
+        kind = KIND_FILE
+    else:
+        name, raw = bundle_files(paths)
+        kind = KIND_BUNDLE
+
+    meta, chunks = build_session(name, raw, kind, chunk_size)
     n = meta["n"]
 
     header_img = payload_to_qr(header_payload(meta))
@@ -512,7 +562,12 @@ def send_file(path: Path, fps: float, chunk_size: int):
     print()
     print("QRTX sender (v2, fountain-coded)")
     print("=" * 50)
-    print(f"File:       {path.name}")
+    if kind == KIND_BUNDLE:
+        print(f"Bundle:     {len(paths)} files -> {name}")
+        for p in paths:
+            print(f"            - {p.name}")
+    else:
+        print(f"File:       {name}")
     print(f"Original:   {meta['olen']:,} bytes")
     print(f"Compressed: {meta['zlen']:,} bytes ({meta['algo']})")
     print(f"Chunks:     {n}")
@@ -590,6 +645,32 @@ def choose_output_path(out_dir: Path, filename: str) -> Path:
     raise RuntimeError("Could not choose a free output filename")
 
 
+def choose_output_dir(out_dir: Path, name: str) -> Path:
+    safe_name = Path(name).name or "bundle"
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    candidate = out_dir / safe_name
+    if not candidate.exists():
+        return candidate
+
+    for i in range(1, 10000):
+        alt = out_dir / f"{safe_name}_{i}"
+        if not alt.exists():
+            return alt
+
+    raise RuntimeError("Could not choose a free output directory")
+
+
+def extract_bundle(raw: bytes, out_dir: Path, name: str) -> Path:
+    target = choose_output_dir(out_dir, Path(name).stem)
+    target.mkdir()
+
+    with tarfile.open(fileobj=io.BytesIO(raw)) as tar:
+        tar.extractall(target, filter="data")
+
+    return target
+
+
 def finalize_received(
     header: dict,
     decoder: FountainDecoder,
@@ -613,6 +694,9 @@ def finalize_received(
 
     if file_sha256(raw) != header["sha"].upper():
         raise ValueError("SHA-256 verification failed")
+
+    if header["kind"] == KIND_BUNDLE:
+        return extract_bundle(raw, out_dir, header["name"])
 
     out_path = choose_output_path(out_dir, header["name"])
     temp_path = out_path.with_name(out_path.name + ".part")
@@ -791,6 +875,8 @@ def receive_file(camera: int, out_dir: Path, width: int, height: int):
                     decoder = FountainDecoder(obj["n"])
                     print(f"Locked session {lock[0]} ({lock[1]} chunks)")
 
+                assert decoder is not None
+
                 if (obj["sid"], obj["n"]) == lock:
                     if kind == "header":
                         if header is None:
@@ -830,7 +916,10 @@ def receive_file(camera: int, out_dir: Path, width: int, height: int):
                         print("SHA-256 verified:")
                         print(header["sha"])
                         print()
-                        print("Saved:")
+                        if header["kind"] == KIND_BUNDLE:
+                            print("Bundle extracted to:")
+                        else:
+                            print("Saved:")
                         print(out_path.resolve())
                         return
 
@@ -880,8 +969,12 @@ def build_parser() -> argparse.ArgumentParser:
 
     sub = p.add_subparsers(dest="cmd", required=True)
 
-    ps = sub.add_parser("send", help="Show a file as a looping QR stream")
-    ps.add_argument("file", type=Path)
+    ps = sub.add_parser(
+        "send",
+        help="Show one or more files as a looping QR stream "
+             "(multiple files are sent as a tar bundle)",
+    )
+    ps.add_argument("files", type=Path, nargs="+")
     ps.add_argument("--fps", type=float, default=DEFAULT_FPS)
     ps.add_argument("--chunk-size", type=int, default=DEFAULT_CHUNK_SIZE)
 
@@ -899,7 +992,7 @@ def main():
     args = build_parser().parse_args()
 
     if args.cmd == "send":
-        send_file(args.file, args.fps, args.chunk_size)
+        send_files(args.files, args.fps, args.chunk_size)
     elif args.cmd == "receive":
         receive_file(args.camera, args.out, args.width, args.height)
 
