@@ -19,6 +19,14 @@ Protocol v2 highlights:
 - Multiple files (`qrtx send *.py`) are packed into one in-memory tar
   bundle and sent as a single session; the receiver auto-extracts it,
   preserving paths relative to the files' common parent folder.
+- Spatial multiplexing: the sender shows several QR codes side by side
+  (`--codes`, default 2), each an independent protocol frame; the
+  receiver decodes them all with detectAndDecodeMulti. Frames are
+  pre-rendered on a background thread so QR generation cost doesn't
+  limit the display frame rate.
+
+Experimental extensions (larger chunks, calibration, color
+multiplexing) live in qrtx_lab.py.
 """
 from __future__ import annotations
 
@@ -30,6 +38,7 @@ import io
 import lzma
 import math
 import os
+import queue
 import random
 import sys
 import tarfile
@@ -44,11 +53,19 @@ MAGIC_DATA = "Q2D"
 
 # Bytes of (compressed) payload carried by each QR data frame.
 DEFAULT_CHUNK_SIZE = 900
+MAX_CHUNK_SIZE = 1200
 
 DEFAULT_FPS = 6.0
 
-# A header frame is inserted every N displayed frames.
+# QR codes shown side by side in each displayed frame. A 16:9 camera
+# frame fits two square codes comfortably, doubling throughput.
+DEFAULT_CODES = 2
+
+# The header replaces one code slot every N displayed frames: often
+# during the first pass (a late receiver needs it to finalize), rarely
+# once every chunk has been shown (receivers almost surely have it).
 HEADER_EVERY = 15
+HEADER_EVERY_STEADY = 50
 
 
 # ============================================================
@@ -734,12 +751,115 @@ def print_monitors():
         print(f"  --monitor {i}   {w}x{h} at ({x}, {y}){tag}")
 
 
+def compose_codes(imgs: list):
+    """Place QR images side by side on a white canvas."""
+    import numpy as np
+
+    if len(imgs) == 1:
+        return imgs[0]
+
+    gap = 30
+    h = max(i.shape[0] for i in imgs)
+    w = sum(i.shape[1] for i in imgs) + gap * (len(imgs) - 1)
+    canvas = np.full((h, w, 3), 255, dtype=np.uint8)
+
+    x = 0
+    for img in imgs:
+        ih, iw = img.shape[:2]
+        y = (h - ih) // 2
+        canvas[y:y + ih, x:x + iw] = img
+        x += iw + gap
+
+    return canvas
+
+
+class FrameFactory:
+    """Schedules and renders the sender's display frames.
+
+    Each display frame shows `codes` QR codes side by side, every one an
+    independent protocol frame. Slot 0 periodically carries the header
+    (often during the systematic first pass, rarely afterwards); all
+    other slots always carry droplets.
+    """
+
+    def __init__(self, meta: dict, chunks: list[bytes], codes: int,
+                 fps: float):
+        self.meta = meta
+        self.chunks = chunks
+        self.codes = codes
+        self.fps = fps
+        self.n = meta["n"]
+        self.frame_no = 0
+        self.data_sent = 0
+        self._header_img = payload_to_qr(header_payload(meta))
+
+    def _next_seed(self) -> int:
+        # Systematic first pass, then endless random droplets.
+        seed = (
+            self.data_sent
+            if self.data_sent < self.n
+            else random.randrange(self.n, 1 << 31)
+        )
+        self.data_sent += 1
+        return seed
+
+    def next_frame(self):
+        header_every = (
+            HEADER_EVERY
+            if self.data_sent < self.n
+            else HEADER_EVERY_STEADY
+        )
+        with_header = self.frame_no % header_every == 0
+
+        imgs = []
+        for slot in range(self.codes):
+            if slot == 0 and with_header:
+                imgs.append(self._header_img)
+            else:
+                seed = self._next_seed()
+                imgs.append(
+                    payload_to_qr(data_payload(self.meta, self.chunks, seed))
+                )
+
+        self.frame_no += 1
+        cycle = self.data_sent // self.n + 1 if self.n else 1
+
+        label = f"droplets {self.data_sent} (pass {cycle})"
+        if with_header:
+            label += "   +header"
+
+        return add_sender_status(
+            compose_codes(imgs),
+            f"{label}   {self.n} chunks",
+            f"session {self.meta['sid']}   {self.codes} codes   "
+            f"{self.fps:g} FPS   compressed {self.meta['zlen']:,} B",
+        )
+
+
+def _produce_frames(factory: FrameFactory, out: queue.Queue,
+                    stop: threading.Event):
+    """Render display frames ahead of time on a background thread.
+
+    QR generation costs ~45 ms per code, which would otherwise be paid
+    inside the display loop and cap the achievable frame rate.
+    """
+    while not stop.is_set():
+        frame = factory.next_frame()
+        while not stop.is_set():
+            try:
+                out.put(frame, timeout=0.2)
+                break
+            except queue.Full:
+                continue
+
+
 def send_files(
     paths: list[Path],
     fps: float,
     chunk_size: int,
     monitor: int | None = None,
     fullscreen: bool = False,
+    codes: int = DEFAULT_CODES,
 ):
     import cv2
 
@@ -752,8 +872,13 @@ def send_files(
     if fps <= 0:
         raise SystemExit("--fps must be > 0")
 
-    if not 100 <= chunk_size <= 1200:
-        raise SystemExit("--chunk-size must be between 100 and 1200 bytes")
+    if not 100 <= chunk_size <= MAX_CHUNK_SIZE:
+        raise SystemExit(
+            f"--chunk-size must be between 100 and {MAX_CHUNK_SIZE} bytes"
+        )
+
+    if not 1 <= codes <= 3:
+        raise SystemExit("--codes must be 1, 2 or 3")
 
     if len(paths) == 1:
         name = paths[0].name
@@ -765,9 +890,6 @@ def send_files(
 
     meta, chunks = build_session(name, raw, kind, chunk_size)
     n = meta["n"]
-
-    header_img = payload_to_qr(header_payload(meta))
-    delay = 1.0 / fps
 
     print()
     print("QRTX sender (v2, fountain-coded)")
@@ -782,41 +904,30 @@ def send_files(
     print(f"Compressed: {meta['zlen']:,} bytes ({meta['algo']})")
     print(f"Chunks:     {n}")
     print(f"Session:    {meta['sid']}")
+    print(f"Rate:       {codes} codes x {chunk_size} B x {fps:g} FPS")
     print()
     print("Press Q or Esc in the QR window to stop.")
 
-    cv2.namedWindow("QRTX Sender", cv2.WINDOW_NORMAL)
-    place_window("QRTX Sender", (900, 980), monitor, fullscreen)
+    factory = FrameFactory(meta, chunks, codes, fps)
+    frames: queue.Queue = queue.Queue(maxsize=4)
+    stop = threading.Event()
+    producer = threading.Thread(
+        target=_produce_frames, args=(factory, frames, stop), daemon=True,
+    )
+    producer.start()
 
-    frame_no = 0
-    data_sent = 0
+    delay = 1.0 / fps
+    first = frames.get()
+
+    cv2.namedWindow("QRTX Sender", cv2.WINDOW_NORMAL)
+    place_window(
+        "QRTX Sender", (first.shape[1], first.shape[0]), monitor, fullscreen,
+    )
 
     try:
+        shown = first
         while True:
             t0 = time.time()
-
-            if frame_no % HEADER_EVERY == 0:
-                img = header_img
-                label = "header"
-            else:
-                # Systematic first pass, then endless random droplets.
-                if data_sent < n:
-                    seed = data_sent
-                else:
-                    seed = random.randrange(n, 1 << 31)
-                data_sent += 1
-
-                img = payload_to_qr(data_payload(meta, chunks, seed))
-                cycle = data_sent // n if n else 0
-                label = f"droplet {data_sent} (seed {seed}, pass {cycle + 1})"
-
-            shown = add_sender_status(
-                img,
-                f"{label}   {n} chunks",
-                f"session {meta['sid']}   {fps:g} FPS   "
-                f"compressed {meta['zlen']:,} B",
-            )
-
             cv2.imshow("QRTX Sender", shown)
 
             elapsed_ms = int((time.time() - t0) * 1000)
@@ -826,9 +937,13 @@ def send_files(
             if key in (27, ord("q"), ord("Q")):
                 return
 
-            frame_no += 1
+            shown = frames.get()
 
     finally:
+        stop.set()
+        while not frames.empty():  # unblock the producer if it's waiting
+            frames.get_nowait()
+        producer.join(timeout=2)
         cv2.destroyAllWindows()
 
 
@@ -1067,6 +1182,12 @@ def receive_file(
     if height > 0:
         cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
 
+    # The driver grants whatever it likes; report reality, because a
+    # camera quietly running at 720p halves the apparent QR size and
+    # silently ruins the decode rate of dense codes.
+    got_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    got_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+
     detector = make_detector()
     reader = LatestFrameReader(cap)
 
@@ -1079,6 +1200,12 @@ def receive_file(
     print()
     print("QRTX receiver (v2, fountain-coded)")
     print("=" * 50)
+    print(f"Camera resolution: {got_w}x{got_h}", end="")
+    if width > 0 and height > 0 and (got_w, got_h) != (width, height):
+        print(f"  (requested {width}x{height} - camera refused;"
+              " dense codes may decode poorly)")
+    else:
+        print()
     print("Point the camera at the sender screen.")
     print("Receiver will lock onto the first QRTX session.")
     print("Press Q or Esc to quit.")
@@ -1095,10 +1222,23 @@ def receive_file(
                     return
                 continue
 
-            text, points, _ = detector.detectAndDecode(frame)
-            parsed = parse_payload(text) if text else None
+            found, texts, points, _ = detector.detectAndDecodeMulti(frame)
 
-            if parsed is not None:
+            if found and points is not None:
+                for pts in points:
+                    cv2.polylines(
+                        frame,
+                        [pts.astype(int).reshape(-1, 2)],
+                        True,
+                        (0, 180, 0),
+                        3,
+                    )
+
+            for text in (texts if found else ()):
+                parsed = parse_payload(text) if text else None
+                if parsed is None:
+                    continue
+
                 kind, obj = parsed
 
                 if lock is None:
@@ -1108,53 +1248,51 @@ def receive_file(
 
                 assert decoder is not None
 
-                if (obj["sid"], obj["n"]) == lock:
-                    if kind == "header":
-                        if header is None:
-                            header = obj
-                            print(
-                                f"Header: {header['name']!r}  "
-                                f"{header['olen']:,} bytes  "
-                                f"({header['zlen']:,} compressed, "
-                                f"{header['algo']})"
-                            )
-                    else:
-                        before = len(decoder.recovered)
-                        decoder.add(obj["seed"], obj["droplet"])
+                if (obj["sid"], obj["n"]) != lock:
+                    continue
 
-                        if len(decoder.recovered) > before:
-                            last_new = time.time()
-                            print(
-                                f"\rChunks {len(decoder.recovered)}"
-                                f"/{decoder.n}  "
-                                f"(droplets {decoder.droplets_used})",
-                                end="",
-                                flush=True,
-                            )
+                if kind == "header":
+                    if header is None:
+                        header = obj
+                        print(
+                            f"Header: {header['name']!r}  "
+                            f"{header['olen']:,} bytes  "
+                            f"({header['zlen']:,} compressed, "
+                            f"{header['algo']})"
+                        )
+                else:
+                    before = len(decoder.recovered)
+                    decoder.add(obj["seed"], obj["droplet"])
 
-                    if points is not None:
-                        pts = points.astype(int).reshape(-1, 2)
-                        cv2.polylines(frame, [pts], True, (0, 180, 0), 3)
-
-                    if decoder.complete and header is not None:
-                        print()
-                        print("All chunks recovered.")
-                        print("Verifying...")
-
-                        out_path = finalize_received(
-                            header, decoder, out_dir, overwrite,
+                    if len(decoder.recovered) > before:
+                        last_new = time.time()
+                        print(
+                            f"\rChunks {len(decoder.recovered)}"
+                            f"/{decoder.n}  "
+                            f"(droplets {decoder.droplets_used})",
+                            end="",
+                            flush=True,
                         )
 
-                        print()
-                        print("SHA-256 verified:")
-                        print(header["sha"])
-                        print()
-                        if header["kind"] == KIND_BUNDLE:
-                            print("Bundle extracted to:")
-                        else:
-                            print("Saved:")
-                        print(out_path.resolve())
-                        return
+                if decoder.complete and header is not None:
+                    print()
+                    print("All chunks recovered.")
+                    print("Verifying...")
+
+                    out_path = finalize_received(
+                        header, decoder, out_dir, overwrite,
+                    )
+
+                    print()
+                    print("SHA-256 verified:")
+                    print(header["sha"])
+                    print()
+                    if header["kind"] == KIND_BUNDLE:
+                        print("Bundle extracted to:")
+                    else:
+                        print("Saved:")
+                    print(out_path.resolve())
+                    return
 
             draw_receiver_status(
                 frame,
@@ -1211,6 +1349,13 @@ def build_parser() -> argparse.ArgumentParser:
     ps.add_argument("--fps", type=float, default=DEFAULT_FPS)
     ps.add_argument("--chunk-size", type=int, default=DEFAULT_CHUNK_SIZE)
     ps.add_argument(
+        "--codes",
+        type=int,
+        default=DEFAULT_CODES,
+        help="QR codes shown side by side per frame (1-3, default "
+             f"{DEFAULT_CODES}); each code multiplies throughput",
+    )
+    ps.add_argument(
         "--monitor",
         type=int,
         default=None,
@@ -1259,7 +1404,7 @@ def main():
     if args.cmd == "send":
         send_files(
             args.files, args.fps, args.chunk_size,
-            args.monitor, args.fullscreen,
+            args.monitor, args.fullscreen, args.codes,
         )
     elif args.cmd == "receive":
         receive_file(
