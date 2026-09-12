@@ -626,12 +626,16 @@ def send_files(paths: list[Path], fps: float, chunk_size: int):
 # Receiver output helpers
 # ============================================================
 
-def choose_output_path(out_dir: Path, filename: str) -> Path:
+def choose_output_path(
+    out_dir: Path,
+    filename: str,
+    overwrite: bool = False,
+) -> Path:
     safe_name = Path(filename).name or "received.bin"
     out_dir.mkdir(parents=True, exist_ok=True)
 
     candidate = out_dir / safe_name
-    if not candidate.exists():
+    if overwrite or not candidate.exists():
         return candidate
 
     stem = candidate.stem
@@ -645,12 +649,16 @@ def choose_output_path(out_dir: Path, filename: str) -> Path:
     raise RuntimeError("Could not choose a free output filename")
 
 
-def choose_output_dir(out_dir: Path, name: str) -> Path:
+def choose_output_dir(
+    out_dir: Path,
+    name: str,
+    overwrite: bool = False,
+) -> Path:
     safe_name = Path(name).name or "bundle"
     out_dir.mkdir(parents=True, exist_ok=True)
 
     candidate = out_dir / safe_name
-    if not candidate.exists():
+    if overwrite or not candidate.exists():
         return candidate
 
     for i in range(1, 10000):
@@ -661,9 +669,14 @@ def choose_output_dir(out_dir: Path, name: str) -> Path:
     raise RuntimeError("Could not choose a free output directory")
 
 
-def extract_bundle(raw: bytes, out_dir: Path, name: str) -> Path:
-    target = choose_output_dir(out_dir, Path(name).stem)
-    target.mkdir()
+def extract_bundle(
+    raw: bytes,
+    out_dir: Path,
+    name: str,
+    overwrite: bool = False,
+) -> Path:
+    target = choose_output_dir(out_dir, Path(name).stem, overwrite)
+    target.mkdir(exist_ok=overwrite)
 
     with tarfile.open(fileobj=io.BytesIO(raw)) as tar:
         tar.extractall(target, filter="data")
@@ -675,6 +688,7 @@ def finalize_received(
     header: dict,
     decoder: FountainDecoder,
     out_dir: Path,
+    overwrite: bool = False,
 ) -> Path:
     compressed = decoder.assemble()[: header["zlen"]]
 
@@ -696,9 +710,9 @@ def finalize_received(
         raise ValueError("SHA-256 verification failed")
 
     if header["kind"] == KIND_BUNDLE:
-        return extract_bundle(raw, out_dir, header["name"])
+        return extract_bundle(raw, out_dir, header["name"], overwrite)
 
-    out_path = choose_output_path(out_dir, header["name"])
+    out_path = choose_output_path(out_dir, header["name"], overwrite)
     temp_path = out_path.with_name(out_path.name + ".part")
 
     temp_path.write_bytes(raw)
@@ -822,7 +836,13 @@ def make_detector():
     return cv2.QRCodeDetector()
 
 
-def receive_file(camera: int, out_dir: Path, width: int, height: int):
+def receive_file(
+    camera: int,
+    out_dir: Path,
+    width: int,
+    height: int,
+    overwrite: bool = False,
+):
     import cv2
 
     cap = cv2.VideoCapture(camera)
@@ -910,7 +930,9 @@ def receive_file(camera: int, out_dir: Path, width: int, height: int):
                         print("All chunks recovered.")
                         print("Verifying...")
 
-                        out_path = finalize_received(header, decoder, out_dir)
+                        out_path = finalize_received(
+                            header, decoder, out_dir, overwrite,
+                        )
 
                         print()
                         print("SHA-256 verified:")
@@ -983,6 +1005,12 @@ def build_parser() -> argparse.ArgumentParser:
     pr.add_argument("--out", type=Path, default=Path("received"))
     pr.add_argument("--width", type=int, default=1920)
     pr.add_argument("--height", type=int, default=1080)
+    pr.add_argument(
+        "--overwrite",
+        action="store_true",
+        help="Replace existing files in --out instead of saving "
+             "under a suffixed name",
+    )
 
     return p
 
@@ -994,7 +1022,9 @@ def main():
     if args.cmd == "send":
         send_files(args.files, args.fps, args.chunk_size)
     elif args.cmd == "receive":
-        receive_file(args.camera, args.out, args.width, args.height)
+        receive_file(
+            args.camera, args.out, args.width, args.height, args.overwrite,
+        )
 
 
 if __name__ == "__main__":
