@@ -618,7 +618,129 @@ def expand_patterns(paths: list[Path]) -> list[Path]:
     return out
 
 
-def send_files(paths: list[Path], fps: float, chunk_size: int):
+def enumerate_monitors() -> list[tuple[int, int, int, int]]:
+    """Best-effort list of monitors as (x, y, width, height), primary first.
+
+    Returns an empty list when the layout can't be determined, in which
+    case callers fall back to OpenCV's default window placement.
+    """
+    monitors: list[tuple[int, int, int, int]] = []
+
+    if sys.platform == "win32":
+        try:
+            import ctypes
+            from ctypes import wintypes
+
+            proc = ctypes.WINFUNCTYPE(
+                ctypes.c_int,
+                ctypes.c_void_p,
+                ctypes.c_void_p,
+                ctypes.POINTER(wintypes.RECT),
+                ctypes.c_void_p,
+            )
+
+            def callback(_hmon, _hdc, rect, _data):
+                r = rect.contents
+                monitors.append(
+                    (r.left, r.top, r.right - r.left, r.bottom - r.top)
+                )
+                return 1
+
+            ctypes.windll.user32.EnumDisplayMonitors(
+                None, None, proc(callback), 0
+            )
+        except Exception:
+            monitors = []
+
+    if not monitors:
+        try:
+            import screeninfo
+
+            monitors = [
+                (m.x, m.y, m.width, m.height)
+                for m in screeninfo.get_monitors()
+            ]
+        except Exception:
+            monitors = []
+
+    # Primary monitor sits at the origin; show it first so --monitor 1
+    # means "the main screen" on every platform.
+    monitors.sort(key=lambda m: (m[0] != 0 or m[1] != 0, m[0], m[1]))
+    return monitors
+
+
+def place_window(
+    name: str,
+    size: tuple[int, int],
+    monitor: int | None = None,
+    fullscreen: bool = False,
+):
+    """Size and position a window so it never straddles two monitors."""
+    import cv2
+
+    mons = enumerate_monitors()
+
+    if monitor is not None:
+        if not mons:
+            raise SystemExit(
+                "--monitor: could not detect monitors on this system "
+                "(try: python -m pip install screeninfo)"
+            )
+        if not 1 <= monitor <= len(mons):
+            raise SystemExit(
+                f"--monitor must be between 1 and {len(mons)}; "
+                "run 'qrtx monitors' to list them"
+            )
+        x, y, mw, mh = mons[monitor - 1]
+    elif mons:
+        x, y, mw, mh = mons[0]
+    else:
+        cv2.resizeWindow(name, *size)
+        return
+
+    if fullscreen:
+        cv2.moveWindow(name, x, y)
+        cv2.setWindowProperty(
+            name, cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN
+        )
+        return
+
+    # Fill ~90% of the chosen monitor while keeping the content's aspect
+    # ratio, so the QR is rendered as large as that screen allows.
+    aspect = size[0] / size[1]
+    h = int(mh * 0.9)
+    w = int(h * aspect)
+    if w > mw * 0.9:
+        w = int(mw * 0.9)
+        h = int(w / aspect)
+
+    cv2.resizeWindow(name, w, h)
+    cv2.moveWindow(name, x + (mw - w) // 2, y + (mh - h) // 2)
+
+
+def print_monitors():
+    mons = enumerate_monitors()
+
+    if not mons:
+        print(
+            "Could not detect monitors on this system.\n"
+            "Install 'screeninfo' for detection, or just drag the window."
+        )
+        return
+
+    print(f"{len(mons)} monitor(s) detected:")
+    for i, (x, y, w, h) in enumerate(mons, 1):
+        tag = "  (primary)" if x == 0 and y == 0 else ""
+        print(f"  --monitor {i}   {w}x{h} at ({x}, {y}){tag}")
+
+
+def send_files(
+    paths: list[Path],
+    fps: float,
+    chunk_size: int,
+    monitor: int | None = None,
+    fullscreen: bool = False,
+):
     import cv2
 
     paths = expand_patterns(paths)
@@ -664,7 +786,7 @@ def send_files(paths: list[Path], fps: float, chunk_size: int):
     print("Press Q or Esc in the QR window to stop.")
 
     cv2.namedWindow("QRTX Sender", cv2.WINDOW_NORMAL)
-    cv2.resizeWindow("QRTX Sender", 900, 980)
+    place_window("QRTX Sender", (900, 980), monitor, fullscreen)
 
     frame_no = 0
     data_sent = 0
@@ -930,6 +1052,7 @@ def receive_file(
     width: int,
     height: int,
     overwrite: bool = False,
+    monitor: int | None = None,
 ):
     import cv2
 
@@ -961,7 +1084,7 @@ def receive_file(
     print("Press Q or Esc to quit.")
 
     cv2.namedWindow("QRTX Receiver", cv2.WINDOW_NORMAL)
-    cv2.resizeWindow("QRTX Receiver", 1000, 700)
+    place_window("QRTX Receiver", (1000, 700), monitor)
 
     try:
         while True:
@@ -1087,6 +1210,18 @@ def build_parser() -> argparse.ArgumentParser:
     ps.add_argument("files", type=Path, nargs="+")
     ps.add_argument("--fps", type=float, default=DEFAULT_FPS)
     ps.add_argument("--chunk-size", type=int, default=DEFAULT_CHUNK_SIZE)
+    ps.add_argument(
+        "--monitor",
+        type=int,
+        default=None,
+        help="Show the QR window on this monitor "
+             "(1-based; see 'qrtx monitors')",
+    )
+    ps.add_argument(
+        "--fullscreen",
+        action="store_true",
+        help="Fill the chosen monitor with the QR window",
+    )
 
     pr = sub.add_parser("receive", help="Receive a QR stream from a camera")
     pr.add_argument("--camera", type=int, default=0)
@@ -1099,19 +1234,37 @@ def build_parser() -> argparse.ArgumentParser:
         help="Replace existing files in --out instead of saving "
              "under a suffixed name",
     )
+    pr.add_argument(
+        "--monitor",
+        type=int,
+        default=None,
+        help="Show the preview window on this monitor "
+             "(1-based; see 'qrtx monitors')",
+    )
+
+    sub.add_parser("monitors", help="List detected monitors and exit")
 
     return p
 
 
 def main():
-    require_runtime_deps()
     args = build_parser().parse_args()
 
+    if args.cmd == "monitors":
+        print_monitors()
+        return
+
+    require_runtime_deps()
+
     if args.cmd == "send":
-        send_files(args.files, args.fps, args.chunk_size)
+        send_files(
+            args.files, args.fps, args.chunk_size,
+            args.monitor, args.fullscreen,
+        )
     elif args.cmd == "receive":
         receive_file(
             args.camera, args.out, args.width, args.height, args.overwrite,
+            args.monitor,
         )
 
 
